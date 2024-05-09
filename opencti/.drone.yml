@@ -1,0 +1,385 @@
+---
+kind: pipeline
+name: opencti-tests
+
+steps:
+  - name: branch-definition
+    image: nikolaik/python-nodejs:python3.11-nodejs20-alpine
+    commands:
+      - apk add git
+      - export OPENCTI_BRANCH=$DRONE_SOURCE_BRANCH
+      - if [ "$(echo "$(git ls-remote --heads https://github.com/OpenCTI-Platform/client-python.git refs/heads/$DRONE_SOURCE_BRANCH)")" != '' ]; then CLIENT_PYTHON_BRANCH=$DRONE_SOURCE_BRANCH; else CLIENT_PYTHON_BRANCH=$([[ "$(echo "$(git ls-remote --heads https://github.com/OpenCTI-Platform/client-python.git refs/heads/opencti/$DRONE_SOURCE_BRANCH)")" != '' ]] && echo opencti/$DRONE_SOURCE_BRANCH || echo 'master'); fi
+      - if [ "$(echo "$(git ls-remote --heads https://github.com/OpenCTI-Platform/connectors.git refs/heads/$DRONE_SOURCE_BRANCH)")" != '' ]; then CONNECTOR_BRANCH=$DRONE_SOURCE_BRANCH; else CONNECTOR_BRANCH=$([[ "$(echo "$(git ls-remote --heads https://github.com/OpenCTI-Platform/connectors.git refs/heads/opencti/$DRONE_SOURCE_BRANCH)")" != '' ]] && echo opencti/$DRONE_SOURCE_BRANCH || echo 'master'); fi
+      - echo "OPENCTI_BRANCH=$DRONE_SOURCE_BRANCH" >> variables
+      - echo "CLIENT_PYTHON_BRANCH=$CLIENT_PYTHON_BRANCH" >> variables
+      - echo "CONNECTOR_BRANCH=$CONNECTOR_BRANCH" >> variables
+      - echo [INFO] Using opencti@$OPENCTI_BRANCH, client-python@$CLIENT_PYTHON_BRANCH and connectors@$CONNECTOR_BRANCH
+
+  - name: api-tests
+    image: nikolaik/python-nodejs:python3.11-nodejs20-alpine
+    volumes:
+    - name: cache-node-backend
+      path: /drone/src/opencti-platform/opencti-graphql/node_modules
+    - name: cache-python
+      path: /usr/lib/python3.11
+    environment:
+      APP__BASE_URL: http://api-tests:4010/
+      APP__ADMIN__PASSWORD: admin
+      APP__SYNC_RAW_START_REMOTE_URI: http://opencti-raw-start:4100/graphql
+      APP__SYNC_LIVE_START_REMOTE_URI: http://opencti-live-start:4200/graphql
+      APP__SYNC_DIRECT_START_REMOTE_URI: http://opencti-direct-start:4300/graphql
+      APP__SYNC_RESTORE_START_REMOTE_URI: http://opencti-restore-start:4400/graphql
+      APP__ADMIN__TOKEN: bfa014e0-e02e-4aa6-a42b-603b19dcf159
+      REDIS__HOSTNAME: redis
+      ELASTICSEARCH__URL: http://elastic:9200
+      MINIO__ENDPOINT: minio
+      RABBITMQ__HOSTNAME: rabbitmq
+      EXPIRATION_SCHEDULER__ENABLED: false
+      SUBSCRIPTION_SCHEDULER__ENABLED: false
+      SMTP__HOSTNAME: smtp.ethereal.email
+      SMTP__PORT: 587
+      SMTP__USERNAME: jennyfer.mraz@ethereal.email
+      SMTP__PASSWORD: frhJ2mSPTfaEutpbug
+      PYTHONUNBUFFERED: 1
+    commands:
+      - apk add build-base git libffi-dev cargo
+      - pip3 install --upgrade setuptools
+      - source ./variables
+      - cd opencti-platform
+      - echo [INFO] Using opencti@$OPENCTI_BRANCH, client-python@$CLIENT_PYTHON_BRANCH and connectors@$CONNECTOR_BRANCH
+      - cd ..
+      - git clone -b $CONNECTOR_BRANCH https://github.com/OpenCTI-Platform/connectors.git opencti-connectors
+      - cd opencti-connectors
+      - CONNECTOR_COMMIT=$(git rev-parse --short HEAD)
+      - echo [INFO] using connectors@$CONNECTOR_BRANCH:$CONNECTOR_COMMIT
+      - cd ../opencti-platform/opencti-graphql
+      - yarn install
+      - yarn build
+      - yarn check-ts
+      - yarn lint
+      - pip3 install --upgrade --force git+https://github.com/OpenCTI-Platform/client-python@$CLIENT_PYTHON_BRANCH
+      - echo [INFO] using package client-python@$CLIENT_PYTHON_BRANCH
+      - NODE_OPTIONS=--max_old_space_size=8192 yarn test
+
+  - name: api-coverage
+    image: plugins/codecov
+    settings:
+      token:
+        from_secret: codecov_token
+      paths:
+        - opencti-platform/opencti-graphql/coverage
+    depends_on:
+      - api-tests
+
+  - name: frontend-tests
+    image: node:20-alpine
+    volumes:
+    - name: cache-node-frontend
+      path: /drone/src/opencti-platform/opencti-front/node_modules
+    - name: cache-python
+      path: /usr/lib/python3.11
+    commands:
+      - apk add git tini gcc g++ make musl-dev cargo python3 python3-dev postfix postfix-pcre
+      - npm install -g node-gyp
+      - cd opencti-platform/opencti-front
+      - yarn install
+      - yarn build
+      - yarn check-ts
+      - yarn lint
+      - NODE_OPTIONS=--max_old_space_size=8192 yarn test
+
+
+  - name: frontend-e2e-tests
+    image: node:20.12.2
+    volumes:
+    - name: cache-node-frontend-e2e
+      path: /drone/src/opencti-platform/opencti-front/node_modules
+    - name: cache-python
+      path: /usr/lib/python3.11
+    environment:
+      BACK_END_URL: http://opencti-e2e-start:4500
+      E2E_TEST: true
+      TEAMS_WEBHOOK: teams-webhook-url
+    commands:
+      - apt-get update
+      - apt-get -y install netcat-traditional
+      - cd opencti-platform/opencti-front
+      - yarn install
+      - npx playwright install --with-deps chromium
+      - yarn build
+      - yarn test:e2e
+    depends_on:
+      - frontend-tests
+
+  - name: frontend-verify-translation
+    image: node:20.12.2
+    commands:
+      - cd opencti-platform/opencti-front
+      - node script/verify-translation.js
+
+  - name: build-circleci
+    image: curlimages/curl
+    commands:
+      - curl -X POST --data "branch=master" https://circleci.com/api/v1.1/project/github/OpenCTI-Platform/opencti/build?circle-token=$CIRCLECI_TOKEN
+    environment:
+      CIRCLECI_TOKEN:
+        from_secret: circleci_token
+    when:
+      branch:
+        - master
+      event:
+        exclude:
+          - pull_request
+          - tag
+    depends_on:
+      - api-tests
+      - frontend-tests
+      - frontend-e2e-tests
+
+  - name: build-circleci-release
+    image: curlimages/curl
+    commands:
+      - curl -X POST --data "tag=$DRONE_TAG" https://circleci.com/api/v1.1/project/github/OpenCTI-Platform/opencti/build?circle-token=$CIRCLECI_TOKEN
+    environment:
+      CIRCLECI_TOKEN:
+        from_secret: circleci_token
+    when:
+      event:
+        - tag
+    depends_on:
+      - api-tests
+      - frontend-tests
+      - frontend-e2e-tests
+
+  - name: slack
+    image: plugins/slack
+    settings:
+      webhook:
+        from_secret: slack_webhook
+      username: drone
+      channel: notifications
+    when:
+      status: [success, failure]
+    depends_on:
+      - api-tests
+      - frontend-tests
+      - frontend-e2e-tests
+
+services:
+  - name: redis
+    image: redis:7.2.4
+  - name: elastic
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.2
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: false
+      ES_JAVA_OPTS: -Xms2g -Xmx2g
+  - name: minio
+    image: minio/minio:RELEASE.2023-07-07T07-13-57Z
+    environment:
+      MINIO_ROOT_USER: ChangeMe
+      MINIO_ROOT_PASSWORD: ChangeMe
+    command: [server, /data]
+  - name: rabbitmq
+    image: rabbitmq:3.13-management
+  - name: opencti-raw-start
+    image: nikolaik/python-nodejs:python3.11-nodejs20-alpine
+    volumes:
+    - name: cache-node-raw-start-backend
+      path: /tmp/raw-start-platform/opencti-graphql/node_modules
+    - name: cache-python
+      path: /usr/lib/python3.11
+    environment:
+      APP__PORT: 4100
+      APP__ADMIN__PASSWORD: admin
+      APP__ADMIN__TOKEN: bfa014e0-e02e-4aa6-a42b-603b19dcf159
+      REDIS__HOSTNAME: redis
+      REDIS__NAMESPACE: raw-start
+      ELASTICSEARCH__URL: http://elastic:9200
+      ELASTICSEARCH__INDEX_PREFIX: raw-start
+      MINIO__ENDPOINT: minio
+      MINIO__BUCKET_NAME: raw-start-bucket
+      RABBITMQ__HOSTNAME: rabbitmq
+      EXPIRATION_SCHEDULER__ENABLED: false
+      SUBSCRIPTION_SCHEDULER__ENABLED: false
+    commands:
+      - sleep 10
+      - cp -a opencti-platform/* /tmp/raw-start-platform/
+      - source ./variables
+      - apk add build-base git libffi-dev cargo
+      - cd /tmp/raw-start-platform/opencti-graphql
+      - yarn install
+      - yarn install:python
+      - pip3 install --upgrade --force git+https://github.com/OpenCTI-Platform/client-python@$CLIENT_PYTHON_BRANCH
+      - NODE_OPTIONS=--max_old_space_size=8192 yarn start
+  - name: opencti-live-start
+    image: nikolaik/python-nodejs:python3.11-nodejs20-alpine
+    volumes:
+    - name: cache-node-live-start-backend
+      path: /tmp/live-start-platform/opencti-graphql/node_modules
+    - name: cache-python
+      path: /usr/lib/python3.11
+    environment:
+      APP__PORT: 4200
+      APP__ADMIN__PASSWORD: admin
+      APP__ADMIN__TOKEN: bfa014e0-e02e-4aa6-a42b-603b19dcf159
+      REDIS__HOSTNAME: redis
+      REDIS__NAMESPACE: live-start
+      ELASTICSEARCH__URL: http://elastic:9200
+      ELASTICSEARCH__INDEX_PREFIX: live-start
+      MINIO__ENDPOINT: minio
+      MINIO__BUCKET_NAME: live-start-bucket
+      RABBITMQ__HOSTNAME: rabbitmq
+      EXPIRATION_SCHEDULER__ENABLED: false
+      SUBSCRIPTION_SCHEDULER__ENABLED: false
+    commands:
+      - sleep 10
+      - cp -a opencti-platform/* /tmp/live-start-platform/
+      - source ./variables
+      - apk add build-base git libffi-dev cargo
+      - cd /tmp/live-start-platform/opencti-graphql
+      - yarn install
+      - yarn install:python
+      - pip3 install --upgrade --force git+https://github.com/OpenCTI-Platform/client-python@$CLIENT_PYTHON_BRANCH
+      - NODE_OPTIONS=--max_old_space_size=8192 yarn start
+  - name: opencti-direct-start
+    image: nikolaik/python-nodejs:python3.11-nodejs20-alpine
+    volumes:
+    - name: cache-node-direct-start-backend
+      path: //tmp/direct-start-platform/opencti-graphql/node_modules
+    - name: cache-python
+      path: /usr/lib/python3.11
+    environment:
+      APP__PORT: 4300
+      APP__ADMIN__PASSWORD: admin
+      APP__ADMIN__TOKEN: bfa014e0-e02e-4aa6-a42b-603b19dcf159
+      REDIS__HOSTNAME: redis
+      REDIS__NAMESPACE: direct-start
+      ELASTICSEARCH__URL: http://elastic:9200
+      ELASTICSEARCH__INDEX_PREFIX: direct-start
+      MINIO__ENDPOINT: minio
+      MINIO__BUCKET_NAME: direct-start-bucket
+      RABBITMQ__HOSTNAME: rabbitmq
+      EXPIRATION_SCHEDULER__ENABLED: false
+      SUBSCRIPTION_SCHEDULER__ENABLED: false
+    commands:
+      - sleep 10
+      - cp -a opencti-platform/* /tmp/direct-start-platform/
+      - source ./variables
+      - apk add build-base git libffi-dev cargo
+      - cd /tmp/direct-start-platform/opencti-graphql
+      - yarn install
+      - yarn install:python
+      - pip3 install --upgrade --force git+https://github.com/OpenCTI-Platform/client-python@$CLIENT_PYTHON_BRANCH
+      - NODE_OPTIONS=--max_old_space_size=8192 yarn start
+  - name: opencti-direct-worker
+    image: nikolaik/python-nodejs:python3.11-nodejs20-alpine
+    volumes:
+    - name: cache-python
+      path: /usr/lib/python3.11
+    environment:
+      OPENCTI_URL: http://opencti-direct-start:4300
+      OPENCTI_TOKEN: bfa014e0-e02e-4aa6-a42b-603b19dcf159
+      WORKER_LOG_LEVEL: info
+    commands:
+      - sleep 10
+      - cp -a opencti-worker /tmp/direct-start-worker
+      - source ./variables
+      - apk add build-base git libffi-dev cargo
+      - while ! nc -z opencti-direct-start 4300 ; do sleep 1 ; done
+      - cd /tmp/direct-start-worker
+      - pip3 install -r src/requirements.txt
+      - pip3 install --upgrade --force git+https://github.com/OpenCTI-Platform/client-python@$CLIENT_PYTHON_BRANCH
+      - python3 src/worker.py
+  - name: opencti-restore-start
+    image: nikolaik/python-nodejs:python3.11-nodejs20-alpine
+    volumes:
+    - name: cache-node-restore-start-backend
+      path: /tmp/restore-start-platform/node_modules
+    - name: cache-python
+      path: /usr/lib/python3.11
+    environment:
+      APP__PORT: 4400
+      APP__ADMIN__PASSWORD: admin
+      APP__ADMIN__TOKEN: bfa014e0-e02e-4aa6-a42b-603b19dcf159
+      REDIS__HOSTNAME: redis
+      REDIS__NAMESPACE: restore-start
+      ELASTICSEARCH__URL: http://elastic:9200
+      ELASTICSEARCH__INDEX_PREFIX: restore-start
+      MINIO__ENDPOINT: minio
+      MINIO__BUCKET_NAME: restore-start-bucket
+      RABBITMQ__HOSTNAME: rabbitmq
+      EXPIRATION_SCHEDULER__ENABLED: false
+      SUBSCRIPTION_SCHEDULER__ENABLED: false
+    commands:
+      - sleep 10
+      - cp -a opencti-platform/* /tmp/restore-start-platform/
+      - apk add build-base git libffi-dev cargo
+      - source ./variables
+      - cd /tmp/restore-start-platform/opencti-graphql
+      - yarn install
+      - yarn install:python
+      - pip3 install --upgrade --force git+https://github.com/OpenCTI-Platform/client-python@$CLIENT_PYTHON_BRANCH
+      - NODE_OPTIONS=--max_old_space_size=8192 yarn start
+  - name: opencti-e2e-start
+    image: nikolaik/python-nodejs:python3.11-nodejs20-alpine
+    volumes:
+    - name: cache-node-e2e-start-backend
+      path: /tmp/e2e-start-platform/node_modules
+    - name: cache-python
+      path: /usr/lib/python3.11
+    environment:
+      APP__PORT: 4500
+      APP__DISABLED_DEV_FEATURES: '[]'
+      APP__ADMIN__PASSWORD: admin
+      APP__ADMIN__TOKEN: bfa014e0-e02e-4aa6-a42b-603b19dcf159
+      REDIS__HOSTNAME: redis
+      REDIS__NAMESPACE: e2e-start
+      ELASTICSEARCH__URL: http://elastic:9200
+      ELASTICSEARCH__INDEX_PREFIX: e2e-start
+      MINIO__ENDPOINT: minio
+      MINIO__BUCKET_NAME: e2e-start-bucket
+      RABBITMQ__HOSTNAME: rabbitmq
+      EXPIRATION_SCHEDULER__ENABLED: false
+      SUBSCRIPTION_SCHEDULER__ENABLED: false
+    commands:
+      - cp -a opencti-platform/* /tmp/e2e-start-platform/
+      - apk add build-base git libffi-dev cargo
+      - cd /tmp/e2e-start-platform/opencti-graphql
+      - yarn install
+      - yarn install:python
+      - BRANCH=$(echo $DRONE_COMMIT_BRANCH | cut -d "/" -f 2)
+      - CLIENT_PYTHON_BRANCH=$([[ "$(echo "$(git ls-remote --heads https://github.com/OpenCTI-Platform/client-python.git opencti/$BRANCH)")" != '' ]] && echo opencti/$BRANCH || echo 'master')
+      - pip3 install --upgrade --force git+https://github.com/OpenCTI-Platform/client-python@$CLIENT_PYTHON_BRANCH
+      - yarn build:dev
+      - yarn wait-api && yarn insert:dev &
+      - NODE_OPTIONS=--max_old_space_size=8192 yarn start
+
+volumes:
+  - name: cache-node-backend
+    host:
+      path: /tmp/cache-node-backend
+  - name: cache-node-raw-start-backend
+    host:
+      path: /tmp/cache-node-raw-start-backend
+  - name: cache-node-live-start-backend
+    host:
+      path: /tmp/cache-node-live-start-backend
+  - name: cache-node-direct-start-backend
+    host:
+      path: /tmp/cache-node-direct-start-backend
+  - name: cache-node-restore-start-backend
+    host:
+      path: /tmp/cache-node-restore-start-backend
+  - name: cache-node-e2e-start-backend
+    host:
+      path: /tmp/cache-node-e2e-start-backend
+  - name: cache-node-frontend
+    host:
+      path: /tmp/cache-node-frontend
+  - name: cache-node-frontend-e2e
+    host:
+      path: /tmp/cache-node-frontend-e2e
+  - name: cache-python
+    host:
+      path: /tmp/cache-python

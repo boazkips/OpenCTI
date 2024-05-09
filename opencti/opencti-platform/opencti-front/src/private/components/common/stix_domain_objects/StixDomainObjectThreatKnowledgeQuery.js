@@ -1,0 +1,17 @@
+import { graphql } from 'react-relay';
+
+// eslint-disable-next-line import/prefer-default-export
+export const stixDomainObjectThreatKnowledgeStixRelationshipsQuery = graphql`
+  query StixDomainObjectThreatKnowledgeQueryStixRelationshipsQuery(
+    $fromOrToId: String
+    $elementWithTargetTypes: [String]
+    $relationship_type: [String]
+    $first: Int
+    $orderBy: StixRelationshipsOrdering
+    $orderMode: OrderingMode
+    $filters: FilterGroup
+  ) {
+    ...StixDomainObjectGlobalKillChain_data
+    ...StixDomainObjectTimeline_data
+  }
+`;
